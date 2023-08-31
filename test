@@ -1,0 +1,17 @@
+SELECT
+    pea.email_address,
+    pu.username,
+    pu.person_id,
+    pu.user_id,
+    to_char(auli.last_login_date, 'mm-dd-yyyy')      last_login_date,
+    to_char(auli.last_login_date + 90, 'mm-dd-yyyy') access_expiry_date
+FROM
+         per_email_addresses pea
+    JOIN per_users           pu ON pea.person_id = pu.person_id
+    JOIN ase_user_login_info auli ON pu.user_guid = auli.user_guid
+WHERE
+        auli.user_guid = pu.user_guid
+    AND pu.username NOT LIKE '%@%'
+AND pu.username NOT LIKE '%-SVC%'
+    AND auli.last_login_date IS NOT NULL
+    AND auli.last_login_date NOT BETWEEN trunc(sysdate) - :p_num_of_days AND trunc(sysdate)
