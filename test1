@@ -9,8 +9,8 @@ FROM
     per_email_addresses pea
 JOIN per_users pu ON pea.person_id = pu.person_id
 LEFT JOIN ase_user_login_info auli ON pu.user_guid = auli.user_guid
-                                   AND auli.last_login_date > trunc(sysdate) - :p_num_of_days
+                                   AND auli.last_login_date >= trunc(sysdate) - :p_num_of_days
 WHERE
     pu.username NOT LIKE '%@%'
     AND pu.username NOT LIKE '%-SVC%'
-    AND (auli.last_login_date IS NULL OR auli.last_login_date <= trunc(sysdate) - :p_num_of_days)
+    AND (auli.last_login_date IS NULL OR auli.last_login_date < trunc(sysdate) - :p_num_of_days)
