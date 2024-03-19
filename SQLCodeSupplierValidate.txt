@@ -1,0 +1,32 @@
+SELECT
+    COUNT(DISTINCT Supp_Party.party_id) AS Supplier_Count
+FROM
+    Poz_Suppliers Supp
+    JOIN Hz_Parties Supp_Party ON Supp_Party.Party_Id = Supp.Party_Id
+    JOIN Hz_Relationships Rel ON Rel.Object_Id = Supp_Party.Party_Id
+    LEFT JOIN Hz_Contact_Points Email ON Email.Owner_Table_id = Rel.Subject_id
+        AND Email.Relationship_id = Rel.Relationship_id
+        AND Email.Owner_Table_Name = 'HZ_PARTIES'
+        AND Email.Contact_Point_Type = 'EMAIL'
+        AND Email.Status = 'A'
+WHERE
+    Supp_Party.Party_Type = 'ORGANIZATION'
+    AND Rel.Relationship_Type = 'CONTACT'
+    AND Rel.relationship_code = 'CONTACT_OF'
+    AND Rel.SUBJECT_TYPE = 'PERSON'
+    AND Rel.OBJECT_TYPE = 'ORGANIZATION'
+    AND Rel.OBJECT_TABLE_NAME = 'HZ_PARTIES'
+    AND Rel.STATUS = 'A'
+    AND (:email_address_parameter IS NULL OR Email.email_address = :email_address_parameter OR Email.email_address LIKE '%' || :email_address_parameter || '%')
+    AND EXISTS (
+        SELECT 1
+        FROM Hz_Parties Per_Parties
+        JOIN HZ_PARTY_USG_ASSIGNMENTS PartyUsageAssignment ON Per_Parties.PARTY_ID = PartyUsageAssignment.PARTY_ID
+        WHERE Per_Parties.Party_Id = Rel.Subject_Id
+            AND Per_Parties.Status = 'A'
+            AND Per_Parties.Party_Type = 'PERSON'
+            AND PartyUsageAssignment.PARTY_USAGE_CODE = 'SUPPLIER_CONTACT'
+            AND PartyUsageAssignment.STATUS_FLAG = 'A'
+            AND NVL(PartyUsageAssignment.EFFECTIVE_START_DATE, sysdate-1) <= sysdate
+            AND NVL(PartyUsageAssignment.EFFECTIVE_END_DATE, sysdate+1) > sysdate
+    )
