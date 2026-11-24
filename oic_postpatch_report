@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+"""Compact, read-only Oracle Integration Gen 3 error report."""
+import argparse, base64, html, json, logging, os, re, sys, time
+from collections import Counter
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
+
+LOG = logging.getLogger("oic-report")
+API = "/ic/api/integration/v1/monitoring/errors"
+RUNS_API = "/ic/api/integration/v1/monitoring/instances"
+
+
+def env_file(name):
+    path = Path(name)
+    if not path.is_file(): raise ValueError(f"Environment file not found: {path.resolve()}")
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if line and not line.startswith("#"):
+            key, sep, value = line.partition("=")
+            if not sep: raise ValueError(f"Invalid env-file line: {raw}")
+            os.environ.setdefault(key.strip(), value.strip().strip("\"'"))
+
+
+def need(name):
+    value = os.getenv(name, "").strip()
+    if not value: raise ValueError(f"Missing required setting: {name}")
+    return value
+
+
+def utc(value):
+    try: result = datetime.fromisoformat(re.sub(r"[zZ]$", "+00:00", value))
+    except ValueError as exc: raise ValueError("Use ISO time, e.g. 2026-09-20T02:00:00Z") from exc
+    return result.replace(tzinfo=timezone.utc) if result.tzinfo is None else result.astimezone(timezone.utc)
+
+
+def stamp(value): return value.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+def esc(value): return html.escape("" if value is None else str(value), quote=True)
+def pick(data, *names, default="—"):
+    return next((str(data[n]) for n in names if data.get(n) not in (None, "")), default)
+def obj(data, *names): return next((data[n] for n in names if isinstance(data.get(n), dict)), {})
+
+
+def get_token():
+    grant = os.getenv("OAUTH_GRANT_TYPE", "client_credentials")
+    if grant != "client_credentials": raise ValueError("OAUTH_GRANT_TYPE must be client_credentials")
+    form = {"grant_type": grant}
+    if os.getenv("OAUTH_SCOPE", "").strip(): form["scope"] = os.environ["OAUTH_SCOPE"].strip()
+    basic = base64.b64encode(f"{need('OAUTH_CLIENT_ID')}:{need('OAUTH_CLIENT_SECRET')}".encode()).decode()
+    request = Request(need("OAUTH_TOKEN_URL"), data=urlencode(form).encode(), method="POST", headers={"Authorization": f"Basic {basic}", "Content-Type": "application/x-www-form-urlencoded"})
+    try:
+        with urlopen(request, timeout=30) as response: token = json.loads(response.read().decode()).get("access_token")
+    except HTTPError as exc: raise RuntimeError(f"OAuth failed ({exc.code}): {exc.read().decode('utf-8', 'replace')[:400]}") from exc
+    if not token: raise RuntimeError("OAuth response did not contain access_token")
+    LOG.info("OAuth access token obtained successfully (value is never logged)")
+    return token
+
+
+def fetch(start, end, integration_code, connection_code):
+    token, base, instance = get_token(), need("OIC_BASE_URL").rstrip("/"), need("OIC_INSTANCE")
+    parts = [f"startdate:'{stamp(start)}'", f"enddate:'{stamp(end)}'"]
+    if integration_code: parts.append("code:'%s'" % integration_code.replace("'", "\\'"))
+    if connection_code: parts.append("connectionCode:'%s'" % connection_code.replace("'", "\\'"))
+    query, offset, limit, output = "{" + ", ".join(parts) + "}", 0, int(os.getenv("OIC_PAGE_SIZE", "50")), []
+    LOG.info("Calling OIC Gen 3 API: GET %s", API)
+    LOG.info("Query window UTC: %s through %s", stamp(start), stamp(end))
+    while True:
+        url = base + API + "?" + urlencode({"integrationInstance": instance, "q": query, "expand": "integration,connection", "offset": offset, "limit": limit})
+        request = Request(url, headers={"Authorization": f"Bearer {token}", "Accept": "application/json"})
+        try:
+            with urlopen(request, timeout=30) as response: data = json.loads(response.read().decode())
+        except HTTPError as exc:
+            body = exc.read().decode("utf-8", "replace")
+            if exc.code == 400 and "limit" in body.lower() and limit > 1:
+                limit = max(1, limit // 2); LOG.warning("OIC page limit reduced to %d", limit); continue
+            raise RuntimeError(f"GET {API} failed ({exc.code}): {body[:700]}") from exc
+        except URLError as exc: raise RuntimeError(f"OIC request failed: {exc.reason}") from exc
+        rows = [row for row in data.get("items", []) if isinstance(row, dict)]
+        output.extend(rows)
+        total = data.get("totalResults") or data.get("total-results") or data.get("totalRecordsCount")
+        if not rows or len(rows) < limit or (isinstance(total, int) and len(output) >= total):
+            LOG.info("OIC returned %d errored instance record(s)", len(output)); return output
+        offset += len(rows)
+
+
+def row(data, window):
+    integration, connection = obj(data, "integration"), obj(data, "connection")
+    name = pick(data, "integrationName", "flowName")
+    if name == "—": name = pick(integration, "name", "displayName", "code", "id")
+    conn = pick(data, "connectionName", "connectionCode")
+    if conn == "—": conn = pick(connection, "displayName", "name", "code", "id")
+    message, details = pick(data, "errorMessage", "message", "errorDetails", default=""), pick(data, "errorDetails", "detailedErrorMessage", default="")
+    text = f"{message} {details} {conn}".lower()
+    kind = "Connection" if re.search(r"connect|socket|dns|ssl|tls|certificate|oauth|token|unauthorized|authentication|\b(?:401|403|407|408|429)\b|timeout", text) else "Integration" if re.search(r"mapping|transform|xpath|schema|validation|business fault|exception", text) else "Other"
+    return {"window": window, "time": pick(data, "lastTrackedTime", "creationDate", "lastUpdatedTime"), "integration": name, "connection": conn, "type": kind, "message": re.sub(r"\s+", " ", message).strip() or "—", "id": pick(data, "id", "instanceId", "integrationInstanceId")}
+
+
+def runs(start, end, integration_code):
+    """Read instance runs (COMPLETED/FAILED/ABORTED) from OIC Gen 3."""
+    token, base, instance = get_token(), need("OIC_BASE_URL").rstrip("/"), need("OIC_INSTANCE")
+    parts = [f"startdate:'{stamp(start)}'", f"enddate:'{stamp(end)}'"]
+    if integration_code: parts.append("code:'%s'" % integration_code.replace("'", "\\'"))
+    query, offset, limit, output = "{" + ", ".join(parts) + "}", 0, int(os.getenv("OIC_PAGE_SIZE", "50")), []
+    LOG.info("Calling OIC Gen 3 API: GET %s", RUNS_API)
+    while True:
+        url = base + RUNS_API + "?" + urlencode({"integrationInstance": instance, "q": query, "return": "metadata", "offset": offset, "limit": limit})
+        try:
+            with urlopen(Request(url, headers={"Authorization": f"Bearer {token}", "Accept": "application/json"}), timeout=30) as response: data = json.loads(response.read().decode())
+        except HTTPError as exc:
+            body = exc.read().decode("utf-8", "replace")
+            if exc.code == 400 and "limit" in body.lower() and limit > 1:
+                limit = max(1, limit // 2); continue
+            raise RuntimeError(f"GET {RUNS_API} failed ({exc.code}): {body[:700]}") from exc
+        rows = [item for item in data.get("items", []) if isinstance(item, dict)]
+        output.extend(rows)
+        total = data.get("totalResults") or data.get("total-results") or data.get("totalRecordsCount")
+        if not rows or len(rows) < limit or (isinstance(total, int) and len(output) >= total): return output
+        offset += len(rows)
+
+
+def run_summary(items):
+    summary = {}
+    for item in items:
+        name = pick(item, "integrationName", "integration", "integrationId")
+        status = pick(item, "status", default="UNKNOWN")
+        bucket = summary.setdefault(name, Counter())
+        bucket[status] += 1
+    return "".join(f"<tr><td>{esc(name)}</td><td>{count['COMPLETED']}</td><td>{count['FAILED']}</td><td>{count['ABORTED']}</td><td>{sum(count.values())}</td></tr>" for name, count in sorted(summary.items())) or "<tr><td colspan='5'>No integration runs returned.</td></tr>"
+
+
+def page_with_runs(instance, title, start, end, errors, comparison, before_runs, after_runs):
+    report = page(instance, title, start, end, errors, comparison)
+    before_label = "Before upgrade" if comparison else "Recent window"
+    after_section = "" if not comparison else f"<section><h2>Integration run summary — After upgrade</h2><table><tr><th>Integration</th><th>Completed</th><th>Failed</th><th>Aborted</th><th>Total</th></tr>{run_summary(after_runs)}</table></section>"
+    sections = f"<section><h2>Integration run summary — {before_label}</h2><table><tr><th>Integration</th><th>Completed</th><th>Failed</th><th>Aborted</th><th>Total</th></tr>{run_summary(before_runs)}</table></section>{after_section}"
+    return report.replace("</main>", sections + "</main>")
+
+
+def page(instance, title, start, end, rows, comparison):
+    types = Counter(r["type"] for r in rows)
+    table = "".join(f"<tr data-i='{esc(r['integration'])}' data-c='{esc(r['connection'])}'><td>{esc(r['window'])}</td><td>{esc(r['time'])}</td><td>{esc(r['integration'])}</td><td>{esc(r['connection'])}</td><td>{esc(r['type'])}</td><td>{esc(r['message'])}</td><td>{esc(r['id'])}</td></tr>" for r in sorted(rows, key=lambda x: x["time"], reverse=True)) or "<tr><td colspan='7'>No errored instances returned.</td></tr>"
+    compare = ""
+    if comparison:
+        before, after = Counter((r["integration"], r["connection"], re.sub(r"\d+", "#", r["message"])) for r in rows if r["window"] == "Before"), Counter((r["integration"], r["connection"], re.sub(r"\d+", "#", r["message"])) for r in rows if r["window"] == "After")
+        all_keys = sorted(set(before) | set(after), key=lambda x: after[x] - before[x], reverse=True)
+        compare_rows = "".join(f"<tr><td>{esc(k[0])}</td><td>{esc(k[1])}</td><td>{before[k]}</td><td>{after[k]}</td><td>{after[k]-before[k]:+d}</td><td>{esc(k[2])}</td></tr>" for k in all_keys) or "<tr><td colspan='6'>No comparison records.</td></tr>"
+        compare = f"<section><h2>Before / after error signatures</h2><table><tr><th>Integration</th><th>Connection</th><th>Before</th><th>After</th><th>Change</th><th>Error</th></tr>{compare_rows}</table></section>"
+    return f"""<!doctype html><html><head><meta charset='utf-8'><title>{esc(title)}</title><style>body{{background:#07111f;color:#e7effd;font:14px Arial;margin:0;padding:25px}}main{{max-width:1500px;margin:auto}}section,.card{{background:#0d1a2f;border:1px solid #29436b;border-radius:12px;padding:18px;margin-bottom:16px}}h1,h2{{margin-top:0}}.cards{{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}}.num{{font-size:28px;font-weight:bold;margin-top:8px}}input{{background:#07111f;border:1px solid #36527c;border-radius:7px;color:white;padding:10px;margin:5px;min-width:220px}}table{{border-collapse:collapse;width:100%;margin-top:14px;min-width:850px}}th{{background:#172a49;text-align:left;font-size:11px;text-transform:uppercase}}td,th{{padding:10px;border-bottom:1px solid #29436b;vertical-align:top}}.wrap{{overflow:auto}}@media(max-width:800px){{.cards{{grid-template-columns:repeat(2,1fr)}}}}</style></head><body><main><section><small>ORACLE INTEGRATION GEN 3 • READ-ONLY MONITORING</small><h1>{esc(title)}</h1><b>Instance:</b> {esc(instance)}<br><b>UTC window:</b> {esc(stamp(start))} to {esc(stamp(end))}</section><div class='cards'><div class='card'>Errored instances<div class='num'>{len(rows)}</div></div><div class='card'>Connection errors<div class='num'>{types['Connection']}</div></div><div class='card'>Integration errors<div class='num'>{types['Integration']}</div></div><div class='card'>Affected integrations<div class='num'>{len({r['integration'] for r in rows if r['integration'] != '—'})}</div></div></div>{compare}<section><h2>Errored instances</h2><input id='all' oninput='f()' placeholder='Search all columns'><input id='i' oninput='f()' placeholder='Filter by integration name'><input id='c' oninput='f()' placeholder='Filter by connection name'><div class='wrap'><table id='rows'><tr><th>Window</th><th>Time</th><th>Integration</th><th>Connection</th><th>Type</th><th>Error</th><th>Instance / Error ID</th></tr>{table}</table></div></section></main><script>function f(){{let q=all.value.toLowerCase(),i=document.getElementById('i').value.toLowerCase(),c=document.getElementById('c').value.toLowerCase();document.querySelectorAll('#rows tr[data-i]').forEach(r=>r.hidden=!r.innerText.toLowerCase().includes(q)||!r.dataset.i.toLowerCase().includes(i)||!r.dataset.c.toLowerCase().includes(c))}}</script></body></html>"""
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Create a read-only OIC Gen 3 error report.")
+    parser.add_argument("--upgrade-time", help="Past UTC upgrade time, e.g. 2026-09-14T02:00:00Z")
+    parser.add_argument("--recent-days", type=float, help="Past rolling window ending now, e.g. 2")
+    parser.add_argument("--days", type=float, default=2, help="Days before and after upgrade (default: 2)")
+    parser.add_argument("--integration-code")
+    parser.add_argument("--connection-code")
+    parser.add_argument("--env-file", default="oic_upgrade_impact.env")
+    args = parser.parse_args()
+    try:
+        env_file(args.env_file)
+        if bool(args.upgrade_time) == bool(args.recent_days): raise ValueError("Use exactly one of --upgrade-time or --recent-days")
+        instance = need("OIC_INSTANCE")
+        safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", instance)
+        if args.recent_days:
+            end, start = datetime.now(timezone.utc), datetime.now(timezone.utc) - timedelta(days=args.recent_days)
+            rows = [row(x, "Recent") for x in fetch(start, end, args.integration_code, args.connection_code)]
+            before_runs, after_runs = runs(start, end, args.integration_code), []
+            days_label = f"{args.recent_days:g}"
+            title, filename, comparison = "Recent Error Sanity Check", f"{safe}_recent_{days_label}_days_{start.strftime('%Y%m%d_%H%M')}_to_{end.strftime('%Y%m%d_%H%M')}.html", False
+        else:
+            upgrade = utc(args.upgrade_time)
+            if upgrade > datetime.now(timezone.utc): raise ValueError("Upgrade time is in the future. Use --recent-days for a live report.")
+            start, end = upgrade - timedelta(days=args.days), upgrade + timedelta(days=args.days)
+            rows = [row(x, "Before") for x in fetch(start, upgrade, args.integration_code, args.connection_code)] + [row(x, "After") for x in fetch(upgrade, end, args.integration_code, args.connection_code)]
+            before_runs, after_runs = runs(start, upgrade, args.integration_code), runs(upgrade, end, args.integration_code)
+            title, filename, comparison = "Upgrade / Patch Impact Report", f"{safe}_impact_{start.strftime('%Y%m%d_%H%M')}_to_{end.strftime('%Y%m%d_%H%M')}.html", True
+        Path("output").mkdir(exist_ok=True)
+        output = Path("output") / filename
+        output.write_text(page_with_runs(instance, title, start, end, rows, comparison, before_runs, after_runs), encoding="utf-8")
+        print(f"Report created: {output.resolve()}")
+    except (ValueError, RuntimeError) as exc:
+        LOG.error("%s", exc); return 1
+    return 0
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(message)s")
+    sys.exit(main())
